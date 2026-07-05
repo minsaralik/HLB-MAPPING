@@ -8,6 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   :root{
     --bg:#16211d; --bg-raised:#1e2d27; --paper:#eae6d9; --amber:#e8a23d; --amber-dim:#7a5a26;
@@ -146,6 +147,7 @@
     <button id="layerBtn" title="Toggle satellite / street">&#9673;</button>
     <button id="outlineBtn" class="textbtn" title="Create outline">OUT</button>
     <button id="roadBtn" class="textbtn" title="Draw roads/streams">RD</button>
+    <button id="importBtn" class="textbtn" title="Import outline from image/PDF">IMG</button>
   </div>
   <div class="legend-toggle"><button id="legendToggle">LEGEND</button></div>
   <div class="legend-panel" id="legendPanel"></div>
@@ -165,6 +167,30 @@
   <div class="field"><label>Building / House number</label><input id="buildingNumber" type="text" placeholder="e.g. 619 or 619/1"></div>
   <div class="field"><label>Notes (optional)</label><textarea id="buildingNote" rows="2" placeholder="e.g. owner name, landmark name"></textarea></div>
   <div class="sheet-actions"><button class="btn-cancel" id="cancelMark">Cancel</button><button class="btn-save" id="saveMark">Save Point</button></div>
+</div></div>
+
+<div class="overlay" id="importOverlay"><div class="sheet" style="max-height:92vh;">
+  <h2 id="impTitle">Import Outline from Map Image</h2>
+  <div class="sub" id="impSub">Upload the layout map (PDF or image) you already have.</div>
+  <div id="impUploadArea">
+    <div class="field"><input type="file" id="refFileInput" accept="image/*,application/pdf"></div>
+    <div class="sub">If the PDF doesn't load, take a screenshot of the map page and upload that image instead.</div>
+  </div>
+  <div id="impImageArea" style="display:none;">
+    <div id="calibWrap" style="overflow:auto; max-height:48vh; border:1px solid var(--border); border-radius:6px; margin-bottom:10px;">
+      <div style="position:relative; display:inline-block;">
+        <img id="refImgEl" style="display:block;">
+        <svg id="calibSvg" style="position:absolute; top:0; left:0; pointer-events:none;"></svg>
+      </div>
+    </div>
+    <div class="db-actions" style="justify-content:flex-start; margin-bottom:8px;">
+      <button id="zoomInImg" type="button">+</button><button id="zoomOutImg" type="button">&minus;</button>
+    </div>
+    <div id="calibPointsList" class="sub"></div>
+  </div>
+  <div class="sheet-actions" id="impActions">
+    <button class="btn-cancel" id="impCancelBtn0">Cancel</button>
+  </div>
 </div></div>
 
 <div class="overlay" id="outlineChoiceOverlay"><div class="sheet">
@@ -794,6 +820,180 @@ function hatchLines(x,y,w,h){
   let l='';
   for(let i=0;i<=w+h;i+=w/3){ l+=`<line x1="${x+Math.max(0,i-h)}" y1="${y+Math.min(i,h)}" x2="${x+Math.min(i,w)}" y2="${y+Math.max(0,i-w)}" stroke="#000" stroke-width="0.3"/>`; }
   return `<g clip-path="url(#clip)">${l}</g>`;
+}
+
+/* ================= Import outline from reference image/PDF ================= */
+let importStep='upload', refImgNaturalW=0, refImgNaturalH=0, currentZoom=1;
+let calibPoints=[], pendingCalibPx=null, imgTransform=null, traceDraft=[];
+
+if(window.pdfjsLib){ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; }
+
+document.getElementById('importBtn').onclick=()=>{
+  if(!blockId){ showToast('Enter a Block ID first'); return; }
+  openImportFlow();
+};
+function openImportFlow(){
+  importStep='upload'; calibPoints=[]; traceDraft=[]; imgTransform=null; pendingCalibPx=null; currentZoom=1;
+  document.getElementById('impImageArea').style.display='none';
+  document.getElementById('impUploadArea').style.display='block';
+  document.getElementById('impTitle').textContent='Import Outline from Map Image';
+  document.getElementById('impSub').textContent='Upload the layout map (PDF or image) you already have.';
+  document.getElementById('impActions').innerHTML='<button class="btn-cancel" id="impCancelBtn0">Cancel</button>';
+  document.getElementById('impCancelBtn0').onclick=closeImportFlow;
+  document.getElementById('refFileInput').value='';
+  document.getElementById('importOverlay').classList.add('open');
+}
+function closeImportFlow(){ document.getElementById('importOverlay').classList.remove('open'); }
+
+document.getElementById('refFileInput').addEventListener('change', async (e)=>{
+  const file = e.target.files[0]; if(!file) return;
+  showToast('Loading file…');
+  try{
+    let dataUrl;
+    if(file.type==='application/pdf'){
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+      const page = await pdf.getPage(1);
+      const viewport = page.getViewport({scale:2.2});
+      const c = document.createElement('canvas'); c.width=viewport.width; c.height=viewport.height;
+      await page.render({canvasContext:c.getContext('2d'), viewport}).promise;
+      dataUrl = c.toDataURL('image/png');
+    } else {
+      dataUrl = await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
+    }
+    loadRefImage(dataUrl);
+  }catch(err){ showToast('Could not read that file'); }
+});
+
+function loadRefImage(dataUrl){
+  const img = document.getElementById('refImgEl');
+  img.onload = ()=>{
+    refImgNaturalW = img.naturalWidth; refImgNaturalH = img.naturalHeight;
+    const wrapW = document.getElementById('calibWrap').clientWidth || 300;
+    currentZoom = Math.min(1, wrapW/refImgNaturalW);
+    applyImgZoom();
+    goToCalibrateStep();
+  };
+  img.src = dataUrl;
+}
+function applyImgZoom(){
+  const img=document.getElementById('refImgEl'), svg=document.getElementById('calibSvg');
+  const w=refImgNaturalW*currentZoom, h=refImgNaturalH*currentZoom;
+  img.style.width=w+'px'; img.style.height=h+'px';
+  svg.style.width=w+'px'; svg.style.height=h+'px';
+  svg.setAttribute('viewBox', `0 0 ${refImgNaturalW} ${refImgNaturalH}`);
+  redrawCalibSvg();
+}
+document.getElementById('zoomInImg').onclick=()=>{ currentZoom=Math.min(currentZoom*1.3,6); applyImgZoom(); };
+document.getElementById('zoomOutImg').onclick=()=>{ currentZoom=Math.max(currentZoom/1.3,0.05); applyImgZoom(); };
+
+function goToCalibrateStep(){
+  importStep='calibrate';
+  document.getElementById('impUploadArea').style.display='none';
+  document.getElementById('impImageArea').style.display='block';
+  document.getElementById('impTitle').textContent='Step 1 of 2 — Calibrate';
+  document.getElementById('impSub').textContent='Tap a landmark you can identify (road junction, building corner), then enter its real coordinates. Repeat for a second point — the further from the first, the more accurate.';
+  document.getElementById('impActions').innerHTML='<button class="btn-cancel" id="impCancelBtn1">Cancel</button>';
+  document.getElementById('impCancelBtn1').onclick=closeImportFlow;
+  document.getElementById('refImgEl').onclick = onCalibClick;
+  renderCalibList();
+}
+function onCalibClick(e){
+  if(calibPoints.length>=2 || pendingCalibPx) return;
+  pendingCalibPx = {px:e.offsetX/currentZoom, py:e.offsetY/currentZoom};
+  renderCalibList();
+}
+function renderCalibList(){
+  const el = document.getElementById('calibPointsList');
+  let html = calibPoints.map((c,i)=>`<div>Point ${i+1}: ${c.lat.toFixed(6)}, ${c.lng.toFixed(6)} &#10003;</div>`).join('');
+  if(pendingCalibPx){
+    html += `<div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+      <input id="calibLat" type="number" step="any" placeholder="Latitude" style="flex:1; min-width:100px; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:7px; border-radius:5px; font-family:var(--font-mono); font-size:12px;">
+      <input id="calibLng" type="number" step="any" placeholder="Longitude" style="flex:1; min-width:100px; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:7px; border-radius:5px; font-family:var(--font-mono); font-size:12px;">
+      <button class="btn-save" style="flex:0 0 auto; padding:8px 12px;" id="confirmCalibPt">Confirm</button>
+    </div>`;
+  }
+  el.innerHTML = html;
+  if(pendingCalibPx){
+    document.getElementById('confirmCalibPt').onclick=()=>{
+      const lat=parseFloat(document.getElementById('calibLat').value);
+      const lng=parseFloat(document.getElementById('calibLng').value);
+      if(isNaN(lat)||isNaN(lng)){ showToast('Enter both coordinates'); return; }
+      calibPoints.push({px:pendingCalibPx.px, py:pendingCalibPx.py, lat, lng});
+      pendingCalibPx=null;
+      renderCalibList();
+      if(calibPoints.length===2){ computeImageTransform(); if(imgTransform) goToTraceStep(); }
+    };
+  }
+  redrawCalibSvg();
+}
+function computeImageTransform(){
+  const [c1,c2] = calibPoints;
+  const R=6378137;
+  const dLat=(c2.lat-c1.lat)*Math.PI/180, dLng=(c2.lng-c1.lng)*Math.PI/180;
+  const metX = dLng*Math.cos(c1.lat*Math.PI/180)*R;
+  const metY = dLat*R;
+  const pixVec = {x: c2.px-c1.px, y: -(c2.py-c1.py)};
+  const pixLen = Math.hypot(pixVec.x,pixVec.y);
+  const metLen = Math.hypot(metX,metY);
+  if(pixLen<1e-6){ showToast('Those two points are too close — pick points further apart'); calibPoints=[]; renderCalibList(); return; }
+  const scale = metLen/pixLen;
+  const rotation = Math.atan2(metY,metX) - Math.atan2(pixVec.y,pixVec.x);
+  imgTransform = {refLat:c1.lat, refLng:c1.lng, originPx:{x:c1.px,y:c1.py}, scale, rotation};
+}
+function imagePxToLatLng(px,py){
+  const dx = px - imgTransform.originPx.x;
+  const dy = -(py - imgTransform.originPx.y);
+  const cosR=Math.cos(imgTransform.rotation), sinR=Math.sin(imgTransform.rotation);
+  const mx = (dx*cosR - dy*sinR)*imgTransform.scale;
+  const my = (dx*sinR + dy*cosR)*imgTransform.scale;
+  const R=6378137;
+  const lat = imgTransform.refLat + (my/R)*(180/Math.PI);
+  const lng = imgTransform.refLng + (mx/(R*Math.cos(imgTransform.refLat*Math.PI/180)))*(180/Math.PI);
+  return {lat,lng};
+}
+function goToTraceStep(){
+  importStep='trace'; traceDraft=[];
+  document.getElementById('impTitle').textContent='Step 2 of 2 — Trace the Boundary';
+  document.getElementById('impSub').textContent='Tap along the boundary line shown in the image, in order. Tap your first point again to close the loop.';
+  document.getElementById('impActions').innerHTML=`
+    <button id="impTraceUndo">Undo</button>
+    <button class="btn-save" id="impTraceFinish" style="flex:1;">Close &amp; Save Outline</button>
+    <button class="btn-cancel" id="impCancelBtn2">Cancel</button>`;
+  document.getElementById('impCancelBtn2').onclick=closeImportFlow;
+  document.getElementById('impTraceUndo').onclick=()=>{ traceDraft.pop(); redrawCalibSvg(); };
+  document.getElementById('impTraceFinish').onclick=finishImageTrace;
+  document.getElementById('refImgEl').onclick = onTraceClick;
+  redrawCalibSvg();
+}
+function onTraceClick(e){
+  const px = e.offsetX/currentZoom, py = e.offsetY/currentZoom;
+  if(traceDraft.length>=3){
+    const d = Math.hypot(px-traceDraft[0].px, py-traceDraft[0].py);
+    if(d < (18/currentZoom)){ finishImageTrace(); return; }
+  }
+  traceDraft.push({px,py});
+  redrawCalibSvg();
+}
+function redrawCalibSvg(){
+  const svg=document.getElementById('calibSvg');
+  let s='';
+  calibPoints.forEach((c,i)=>{ s+=`<circle cx="${c.px}" cy="${c.py}" r="${8/currentZoom}" fill="#3ddc6a" stroke="#0d1a16" stroke-width="${2/currentZoom}"/><text x="${c.px+10/currentZoom}" y="${c.py}" fill="#3ddc6a" font-size="${16/currentZoom}" font-family="monospace">${i+1}</text>`; });
+  if(pendingCalibPx){ s+=`<circle cx="${pendingCalibPx.px}" cy="${pendingCalibPx.py}" r="${8/currentZoom}" fill="none" stroke="#e8a23d" stroke-width="${2/currentZoom}"/>`; }
+  if(importStep==='trace' && traceDraft.length){
+    const pts = traceDraft.map(p=>`${p.px},${p.py}`).join(' ');
+    s += `<polyline points="${pts}" fill="none" stroke="#ff5a5a" stroke-width="${3/currentZoom}"/>`;
+    traceDraft.forEach(p=>{ s+=`<circle cx="${p.px}" cy="${p.py}" r="${5/currentZoom}" fill="#ff5a5a"/>`; });
+  }
+  svg.innerHTML = s;
+}
+function finishImageTrace(){
+  if(traceDraft.length<3){ showToast('Add at least 3 boundary points'); return; }
+  const pts = traceDraft.map(p=>{ const ll=imagePxToLatLng(p.px,p.py); return {lat:ll.lat, lng:ll.lng, manual:true}; });
+  boundary = {points:pts, closed:true, method:'image'};
+  closeImportFlow();
+  renderBoundary(); refreshInsideFlags(); saveBlock(); fitToPoints();
+  showToast('Outline imported from image');
 }
 
 /* ================= Toast ================= */
