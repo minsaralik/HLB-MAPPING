@@ -51,6 +51,17 @@
   .legend-panel.open{display:block;}
   .legend-panel div{display:flex; align-items:center; gap:6px; margin:3px 0;}
   .legend-panel canvas{flex-shrink:0;}
+  .mapctrls button.textbtn{width:auto; min-width:38px; padding:0 8px; font-family:var(--font-mono); font-size:9px; letter-spacing:0.03em;}
+
+  .drawbanner{position:absolute; top:0; left:0; right:0; z-index:700; background:rgba(16,24,20,0.97); border-bottom:1.5px solid var(--amber); padding:9px 10px; display:none; flex-direction:column; gap:7px;}
+  .db-label{font-family:var(--font-mono); font-size:10.5px; color:var(--amber); text-align:center; letter-spacing:0.02em;}
+  .db-actions{display:flex; gap:6px; justify-content:center; flex-wrap:wrap;}
+  .db-actions button{font-family:var(--font-mono); font-size:10px; padding:9px 13px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);}
+  .db-actions button.primary{background:var(--amber); color:#1a1408; border-color:var(--amber); font-weight:700;}
+  .db-actions button.danger{color:var(--danger); border-color:var(--danger);}
+  .chip-row{display:flex; gap:6px; justify-content:center;}
+  .chip{font-family:var(--font-mono); font-size:9.5px; padding:6px 11px; border-radius:14px; border:1px solid var(--border); background:var(--bg); color:var(--text-dim);}
+  .chip.selected{background:var(--teal); color:#0d1a16; border-color:var(--teal); font-weight:700;}
 
   .pulse-dot{width:16px; height:16px; border-radius:50%; background:var(--teal); border:2px solid var(--paper); box-shadow:0 0 0 rgba(95,168,149,0.5); animation:radar 2s infinite;}
   @keyframes radar{0%{box-shadow:0 0 0 0 rgba(95,168,149,0.55);} 70%{box-shadow:0 0 0 16px rgba(95,168,149,0);} 100%{box-shadow:0 0 0 0 rgba(95,168,149,0);}}
@@ -125,9 +136,16 @@
 
 <div class="mapwrap">
   <div id="map"></div>
+  <div class="drawbanner" id="drawBanner">
+    <div class="db-label" id="dbLabel"></div>
+    <div id="dbExtra"></div>
+    <div class="db-actions" id="dbActions"></div>
+  </div>
   <div class="mapctrls">
     <button id="followBtn" class="active" title="Follow my location">&#9678;</button>
     <button id="layerBtn" title="Toggle satellite / street">&#9673;</button>
+    <button id="outlineBtn" class="textbtn" title="Create outline">OUT</button>
+    <button id="roadBtn" class="textbtn" title="Draw roads/streams">RD</button>
   </div>
   <div class="legend-toggle"><button id="legendToggle">LEGEND</button></div>
   <div class="legend-panel" id="legendPanel"></div>
@@ -147,6 +165,16 @@
   <div class="field"><label>Building / House number</label><input id="buildingNumber" type="text" placeholder="e.g. 619 or 619/1"></div>
   <div class="field"><label>Notes (optional)</label><textarea id="buildingNote" rows="2" placeholder="e.g. owner name, landmark name"></textarea></div>
   <div class="sheet-actions"><button class="btn-cancel" id="cancelMark">Cancel</button><button class="btn-save" id="saveMark">Save Point</button></div>
+</div></div>
+
+<div class="overlay" id="outlineChoiceOverlay"><div class="sheet">
+  <h2>Create Layout Map Outline</h2>
+  <div class="sub">Choose how to trace this block's boundary. This replaces any existing saved outline.</div>
+  <div class="sheet-actions" style="flex-direction:column;">
+    <button class="btn-save" id="chooseWalk" style="margin-bottom:8px;">1. Walk the Boundary</button>
+    <button class="btn-save" id="chooseCoords" style="margin-bottom:8px; background:var(--teal);">2. Mark Points on Map</button>
+    <button class="btn-cancel" id="cancelOutlineChoice">Cancel</button>
+  </div>
 </div></div>
 
 <div class="overlay" id="listOverlay"><div class="sheet">
@@ -209,7 +237,12 @@ function symbolToDataUrl(sym, size, color){
 
 /* ================= State ================= */
 let blockId='', points=[], currentPos=null, selectedSymbol=SYMBOLS[0].id, followMode=true, usingSatellite=true;
-let map, liveMarker, accCircle, trailLine, trailCoords=[], pointMarkers={};
+let map, liveMarker, accCircle, trailLine, trailCoords=[], pointMarkers={}, warningRings={};
+let boundary={points:[], closed:false, method:null}, boundaryLayer=null;
+let roadFeatures=[], roadLayers={};
+let mode=null; // null | 'boundary-walk' | 'boundary-coords' | 'road-draw'
+let boundaryDraft=[], boundaryDraftLine=null, boundaryVertexMarkers=[], boundaryWalkTimer=null, boundaryClickHandler=null;
+let roadDraftCoords=[], roadDraftLine=null, roadSelectedKind='road', roadClickHandlerRef=null;
 
 /* ================= Map init (free basemaps, no API key) ================= */
 const esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
@@ -246,22 +279,30 @@ const liveIcon = L.divIcon({className:'', html:'<div class="pulse-dot"></div>', 
 async function loadBlock(id){
   points=[]; clearMarkers();
   trailCoords=[]; if(trailLine){ map.removeLayer(trailLine); trailLine=null; }
+  boundary={points:[], closed:false, method:null}; clearBoundaryLayer();
+  roadFeatures=[]; clearRoadLayers();
+  Object.values(warningRings).forEach(w=>map.removeLayer(w)); warningRings={};
   try{
     const res = await window.storage.get('hlb:'+id);
     if(res && res.value){
       const data = JSON.parse(res.value);
       points = data.points || [];
       trailCoords = data.trail || [];
+      boundary = data.boundary || {points:[], closed:false, method:null};
+      roadFeatures = data.roads || [];
     }
   }catch(e){}
   points.forEach(addMarkerForPoint);
   if(trailCoords.length>1){ trailLine = L.polyline(trailCoords,{color:'#e8a23d', weight:2, opacity:0.55}).addTo(map); }
+  renderBoundary();
+  renderAllRoads();
+  refreshInsideFlags();
   updateGpsCount();
   fitToPoints();
 }
 async function saveBlock(){
   if(!blockId) return;
-  try{ await window.storage.set('hlb:'+blockId, JSON.stringify({points, trail:trailCoords})); }catch(e){ showToast('Save failed'); }
+  try{ await window.storage.set('hlb:'+blockId, JSON.stringify({points, trail:trailCoords, boundary, roads:roadFeatures})); }catch(e){ showToast('Save failed'); }
 }
 let lastSavedTrailLen = 0;
 setInterval(()=>{
@@ -272,9 +313,202 @@ setInterval(()=>{
 }, 15000);
 function clearMarkers(){ Object.values(pointMarkers).forEach(m=>map.removeLayer(m)); pointMarkers={}; }
 function fitToPoints(){
-  if(points.length===0) return;
-  const bounds = L.latLngBounds(points.map(p=>[p.lat,p.lng]));
+  const all = points.map(p=>[p.lat,p.lng]).concat(boundary.points.map(p=>[p.lat,p.lng]));
+  if(all.length===0) return;
+  const bounds = L.latLngBounds(all);
   map.fitBounds(bounds.pad(0.3));
+}
+
+/* ---- Boundary rendering ---- */
+function clearBoundaryLayer(){ if(boundaryLayer){ map.removeLayer(boundaryLayer); boundaryLayer=null; } }
+function renderBoundary(){
+  clearBoundaryLayer();
+  if(boundary.points.length<2) return;
+  const latlngs = boundary.points.map(p=>[p.lat,p.lng]);
+  boundaryLayer = boundary.closed
+    ? L.polygon(latlngs, {color:'#ff5a5a', weight:2.5, fillOpacity:0.04}).addTo(map)
+    : L.polyline(latlngs, {color:'#ff5a5a', weight:2.5}).addTo(map);
+}
+function pointInPolygon(lat,lng,poly){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i].lat, yi=poly[i].lng, xj=poly[j].lat, yj=poly[j].lng;
+    const intersect = ((yi>lng)!==(yj>lng)) && (lat < (xj-xi)*(lng-yi)/(yj-yi)+xi);
+    if(intersect) inside=!inside;
+  }
+  return inside;
+}
+function refreshInsideFlags(){
+  Object.values(warningRings).forEach(w=>map.removeLayer(w)); warningRings={};
+  if(!boundary.closed || boundary.points.length<3) return;
+  points.forEach(p=>{
+    const inside = pointInPolygon(p.lat,p.lng,boundary.points);
+    if(!inside){ warningRings[p.id] = L.circleMarker([p.lat,p.lng], {radius:13, color:'#ff5a5a', weight:2, fill:false, dashArray:'3,3'}).addTo(map); }
+  });
+}
+
+/* ---- Road feature rendering ---- */
+function clearRoadLayers(){ Object.values(roadLayers).forEach(l=>map.removeLayer(l)); roadLayers={}; }
+function roadStyle(kind){
+  if(kind==='walkway') return {color:'#f2f2f2', weight:1.5, dashArray:'4,4', opacity:0.9};
+  if(kind==='stream') return {color:'#4fa8e8', weight:2.5, dashArray:'1,4', opacity:0.9};
+  return {color:'#f2f2f2', weight:3, opacity:0.9};
+}
+function renderRoadFeature(f){ roadLayers[f.id] = L.polyline(f.coords, roadStyle(f.kind)).addTo(map); }
+function renderAllRoads(){ clearRoadLayers(); roadFeatures.forEach(renderRoadFeature); }
+
+/* ---- Drawing banner helper ---- */
+function showBanner(label, actionsHtml, extraHtml){
+  document.getElementById('dbLabel').textContent = label;
+  document.getElementById('dbExtra').innerHTML = extraHtml || '';
+  document.getElementById('dbActions').innerHTML = actionsHtml;
+  document.getElementById('drawBanner').style.display='flex';
+}
+function hideBanner(){ document.getElementById('drawBanner').style.display='none'; }
+
+/* ---- Outline creation: choice ---- */
+document.getElementById('outlineBtn').onclick=()=>{
+  if(!blockId){ showToast('Enter a Block ID first'); return; }
+  document.getElementById('outlineChoiceOverlay').classList.add('open');
+};
+document.getElementById('cancelOutlineChoice').onclick=()=>document.getElementById('outlineChoiceOverlay').classList.remove('open');
+document.getElementById('chooseWalk').onclick=()=>{ document.getElementById('outlineChoiceOverlay').classList.remove('open'); startBoundaryWalk(); };
+document.getElementById('chooseCoords').onclick=()=>{ document.getElementById('outlineChoiceOverlay').classList.remove('open'); startBoundaryCoords(); };
+
+/* ---- Outline creation: walk mode ---- */
+function startBoundaryWalk(){
+  mode='boundary-walk'; boundaryDraft=[];
+  if(boundaryDraftLine){ map.removeLayer(boundaryDraftLine); boundaryDraftLine=null; }
+  showBanner('Recording outline — auto point every 10s', `
+    <button class="primary" id="bwMark">Mark Border Point</button>
+    <button id="bwFinish">Finish Outline</button>
+    <button class="danger" id="bwCancel">Cancel</button>`);
+  document.getElementById('bwMark').onclick=()=>addBoundaryDraftPoint(true);
+  document.getElementById('bwFinish').onclick=finishBoundaryWalk;
+  document.getElementById('bwCancel').onclick=cancelBoundaryDraft;
+  boundaryWalkTimer=setInterval(()=>addBoundaryDraftPoint(false),10000);
+  showToast('Walk the boundary — recording started');
+}
+function addBoundaryDraftPoint(manual){
+  if(!currentPos){ if(manual) showToast('Waiting for GPS fix…'); return; }
+  boundaryDraft.push({lat:currentPos.lat, lng:currentPos.lng, manual});
+  const latlngs = boundaryDraft.map(p=>[p.lat,p.lng]);
+  if(!boundaryDraftLine) boundaryDraftLine = L.polyline(latlngs,{color:'#3ddc6a', weight:3}).addTo(map);
+  else boundaryDraftLine.setLatLngs(latlngs);
+  if(manual) showToast('Border point marked');
+}
+function finishBoundaryWalk(){
+  clearInterval(boundaryWalkTimer); boundaryWalkTimer=null;
+  if(boundaryDraft.length<2){ showToast('Not enough points captured'); cancelBoundaryDraft(); return; }
+  const close = confirm('Close the loop by connecting the last point back to the start?');
+  boundary={points:boundaryDraft, closed:close, method:'walk'};
+  finalizeBoundary();
+}
+
+/* ---- Outline creation: map-tap mode ---- */
+function startBoundaryCoords(){
+  mode='boundary-coords'; boundaryDraft=[];
+  boundaryVertexMarkers.forEach(m=>map.removeLayer(m)); boundaryVertexMarkers=[];
+  if(boundaryDraftLine){ map.removeLayer(boundaryDraftLine); boundaryDraftLine=null; }
+  followMode=false; document.getElementById('followBtn').classList.remove('active');
+  showBanner('Tap the map to add boundary points. Tap point 1 to close the loop.', `
+    <button id="bcUndo">Undo last point</button>
+    <button class="danger" id="bcCancel">Cancel</button>`);
+  document.getElementById('bcUndo').onclick=()=>{
+    if(boundaryDraft.length){
+      boundaryDraft.pop();
+      const m=boundaryVertexMarkers.pop(); if(m) map.removeLayer(m);
+      redrawBoundaryDraftLine();
+    }
+  };
+  document.getElementById('bcCancel').onclick=cancelBoundaryDraft;
+  boundaryClickHandler=(e)=>{
+    const {lat,lng}=e.latlng;
+    if(boundaryDraft.length>=3){
+      const p1=map.latLngToContainerPoint([boundaryDraft[0].lat, boundaryDraft[0].lng]);
+      const p2=map.latLngToContainerPoint([lat,lng]);
+      if(Math.hypot(p1.x-p2.x,p1.y-p2.y) < 25){
+        boundary={points:boundaryDraft, closed:true, method:'coords'};
+        finalizeBoundary();
+        return;
+      }
+    }
+    boundaryDraft.push({lat,lng,manual:true});
+    boundaryVertexMarkers.push(L.circleMarker([lat,lng],{radius:5,color:'#3ddc6a',weight:2,fillColor:'#3ddc6a',fillOpacity:1}).addTo(map));
+    redrawBoundaryDraftLine();
+  };
+  map.on('click', boundaryClickHandler);
+}
+function redrawBoundaryDraftLine(){
+  const latlngs = boundaryDraft.map(p=>[p.lat,p.lng]);
+  if(boundaryDraftLine) map.removeLayer(boundaryDraftLine);
+  if(latlngs.length>1) boundaryDraftLine = L.polyline(latlngs,{color:'#3ddc6a', weight:3}).addTo(map);
+}
+function cancelBoundaryDraft(){
+  clearInterval(boundaryWalkTimer); boundaryWalkTimer=null;
+  if(boundaryClickHandler){ map.off('click', boundaryClickHandler); boundaryClickHandler=null; }
+  if(boundaryDraftLine){ map.removeLayer(boundaryDraftLine); boundaryDraftLine=null; }
+  boundaryVertexMarkers.forEach(m=>map.removeLayer(m)); boundaryVertexMarkers=[];
+  boundaryDraft=[]; mode=null; hideBanner();
+  showToast('Outline drawing cancelled');
+}
+function finalizeBoundary(){
+  clearInterval(boundaryWalkTimer); boundaryWalkTimer=null;
+  if(boundaryClickHandler){ map.off('click', boundaryClickHandler); boundaryClickHandler=null; }
+  if(boundaryDraftLine){ map.removeLayer(boundaryDraftLine); boundaryDraftLine=null; }
+  boundaryVertexMarkers.forEach(m=>map.removeLayer(m)); boundaryVertexMarkers=[];
+  boundaryDraft=[]; mode=null; hideBanner();
+  renderBoundary(); refreshInsideFlags(); saveBlock();
+  showToast('Outline saved');
+}
+
+/* ---- Road / stream drawing ---- */
+document.getElementById('roadBtn').onclick=()=>{
+  if(!blockId){ showToast('Enter a Block ID first'); return; }
+  startRoadDraw();
+};
+function startRoadDraw(){
+  mode='road-draw'; roadDraftCoords=[]; roadSelectedKind='road';
+  if(roadDraftLine){ map.removeLayer(roadDraftLine); roadDraftLine=null; }
+  followMode=false; document.getElementById('followBtn').classList.remove('active');
+  renderRoadBanner();
+  roadClickHandlerRef=(e)=>{ roadDraftCoords.push([e.latlng.lat,e.latlng.lng]); redrawRoadDraft(); };
+  map.on('click', roadClickHandlerRef);
+}
+function renderRoadBanner(){
+  showBanner('Tap the map to draw a line, then Finish Line.', `
+    <button id="rdUndo">Undo point</button>
+    <button class="primary" id="rdFinishLine">Finish Line</button>
+    <button class="danger" id="rdDone">Done</button>`,
+    `<div class="chip-row">
+      <button class="chip ${roadSelectedKind==='road'?'selected':''}" id="chipRoad">Road</button>
+      <button class="chip ${roadSelectedKind==='walkway'?'selected':''}" id="chipWalk">Walkway</button>
+      <button class="chip ${roadSelectedKind==='stream'?'selected':''}" id="chipStream">Stream</button>
+    </div>`);
+  document.getElementById('chipRoad').onclick=()=>{ roadSelectedKind='road'; renderRoadBanner(); redrawRoadDraft(); };
+  document.getElementById('chipWalk').onclick=()=>{ roadSelectedKind='walkway'; renderRoadBanner(); redrawRoadDraft(); };
+  document.getElementById('chipStream').onclick=()=>{ roadSelectedKind='stream'; renderRoadBanner(); redrawRoadDraft(); };
+  document.getElementById('rdUndo').onclick=()=>{ if(roadDraftCoords.length){ roadDraftCoords.pop(); redrawRoadDraft(); } };
+  document.getElementById('rdFinishLine').onclick=finishRoadLine;
+  document.getElementById('rdDone').onclick=finishRoadDrawMode;
+}
+function redrawRoadDraft(){
+  if(roadDraftLine){ map.removeLayer(roadDraftLine); roadDraftLine=null; }
+  if(roadDraftCoords.length>1) roadDraftLine = L.polyline(roadDraftCoords, roadStyle(roadSelectedKind)).addTo(map);
+}
+function finishRoadLine(){
+  if(roadDraftCoords.length<2){ showToast('Add at least 2 points first'); return; }
+  const feature={id:Date.now()+'-'+Math.random().toString(36).slice(2,6), kind:roadSelectedKind, coords:roadDraftCoords, t:new Date().toISOString()};
+  roadFeatures.push(feature); renderRoadFeature(feature);
+  if(roadDraftLine){ map.removeLayer(roadDraftLine); roadDraftLine=null; }
+  roadDraftCoords=[]; saveBlock();
+  showToast(feature.kind+' saved — draw another or tap Done');
+}
+function finishRoadDrawMode(){
+  if(roadDraftCoords.length>=2) finishRoadLine();
+  if(roadClickHandlerRef){ map.off('click', roadClickHandlerRef); roadClickHandlerRef=null; }
+  if(roadDraftLine){ map.removeLayer(roadDraftLine); roadDraftLine=null; }
+  roadDraftCoords=[]; mode=null; hideBanner();
 }
 
 /* ================= GPS ================= */
@@ -348,6 +582,7 @@ function addMarkerForPoint(pt){
     e.popup.getElement().querySelector('.popup-del').onclick = ()=>{
       points = points.filter(p=>p.id!==pt.id);
       map.removeLayer(m); delete pointMarkers[pt.id];
+      if(warningRings[pt.id]){ map.removeLayer(warningRings[pt.id]); delete warningRings[pt.id]; }
       saveBlock(); updateGpsCount(); showToast('Point removed');
     };
   });
@@ -368,7 +603,7 @@ document.getElementById('saveMark').onclick=()=>{
   if(!number){ showToast('Enter a building number'); return; }
   const pt = {id:Date.now()+'-'+Math.random().toString(36).slice(2,7), type:selectedSymbol, number,
     note:document.getElementById('buildingNote').value.trim(), lat:currentPos.lat, lng:currentPos.lng, acc:currentPos.acc, t:new Date().toISOString()};
-  points.push(pt); addMarkerForPoint(pt); saveBlock(); updateGpsCount();
+  points.push(pt); addMarkerForPoint(pt); refreshInsideFlags(); saveBlock(); updateGpsCount();
   document.getElementById('markOverlay').classList.remove('open');
   showToast('Point saved');
 };
@@ -389,6 +624,7 @@ function renderList(){
     row.querySelector('.pdel').onclick=()=>{
       points=points.filter(p=>p.id!==pt.id);
       if(pointMarkers[pt.id]){ map.removeLayer(pointMarkers[pt.id]); delete pointMarkers[pt.id]; }
+      if(warningRings[pt.id]){ map.removeLayer(warningRings[pt.id]); delete warningRings[pt.id]; }
       saveBlock(); updateGpsCount(); renderList(); showToast('Point removed');
     };
     row.addEventListener('click', (e)=>{ if(e.target.classList.contains('pdel')) return; map.panTo([pt.lat,pt.lng]); document.getElementById('listOverlay').classList.remove('open'); });
@@ -410,16 +646,28 @@ document.getElementById('exportCsv').onclick=()=>{
   download((blockId||'hlb')+'_points.csv', csv, 'text/csv');
 };
 document.getElementById('exportKml').onclick=()=>{
-  if(points.length===0){ showToast('No points to export'); return; }
+  if(points.length===0 && boundary.points.length===0 && roadFeatures.length===0){ showToast('No data to export'); return; }
   let kml=`<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${blockId||'HLB'}</name>`;
   points.forEach(p=>{ const sym=SYMBOLS.find(s=>s.id===p.type); kml+=`<Placemark><name>${p.number}</name><description>${sym?sym.label:''} ${p.note?('- '+p.note):''}</description><Point><coordinates>${p.lng},${p.lat},0</coordinates></Point></Placemark>`; });
+  if(boundary.points.length>1){
+    const coordStr = boundary.points.map(p=>`${p.lng},${p.lat},0`).join(' ');
+    if(boundary.closed){
+      kml += `<Placemark><name>Block Boundary</name><Polygon><outerBoundaryIs><LinearRing><coordinates>${coordStr} ${boundary.points[0].lng},${boundary.points[0].lat},0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>`;
+    } else {
+      kml += `<Placemark><name>Block Boundary (open)</name><LineString><coordinates>${coordStr}</coordinates></LineString></Placemark>`;
+    }
+  }
+  roadFeatures.forEach(f=>{
+    const coordStr = f.coords.map(c=>`${c[1]},${c[0]},0`).join(' ');
+    kml += `<Placemark><name>${f.kind}</name><LineString><coordinates>${coordStr}</coordinates></LineString></Placemark>`;
+  });
   kml+='</Document></kml>';
   download((blockId||'hlb')+'_points.kml', kml, 'application/vnd.google-earth.kml+xml');
 };
 
 /* ================= Print / PDF (outline + markings only, no satellite) ================= */
 document.getElementById('exportPrint').onclick = ()=>{
-  if(points.length===0 && trailCoords.length===0){ showToast('Nothing to print yet'); return; }
+  if(points.length===0 && trailCoords.length===0 && boundary.points.length===0){ showToast('Nothing to print yet'); return; }
   buildPrintView();
   document.getElementById('exportOverlay').classList.remove('open');
   setTimeout(()=> window.print(), 150);
@@ -429,38 +677,51 @@ window.addEventListener('afterprint', ()=>{ document.getElementById('printArea')
 function buildPrintView(){
   const PAGE_W = 297, PAGE_H = 420; // A3 portrait, mm
   const MARGIN = 10;
-  const HEADER_H = 26, LEGEND_H = 34;
+  const HEADER_H = 26, LEGEND_H = 46;
   const drawW = PAGE_W - MARGIN*2;
   const drawH = PAGE_H - MARGIN*2 - HEADER_H - LEGEND_H;
 
-  // reference origin = first available coordinate
-  const ref = (points[0] || trailCoords[0]);
-  if(!ref) return;
-  const refLat = Array.isArray(ref) ? ref[0] : ref.lat;
-  const refLng = Array.isArray(ref) ? ref[1] : ref.lng;
+  const ref = boundary.points[0] || points[0] || (trailCoords[0] ? {lat:trailCoords[0][0], lng:trailCoords[0][1]} : null);
+  if(!ref){ showToast('Nothing to print yet'); return; }
+  const refLat = ref.lat, refLng = ref.lng;
   const R = 6378137;
   function toM(lat,lng){
     const dLat=(lat-refLat)*Math.PI/180, dLng=(lng-refLng)*Math.PI/180;
     return { x: dLng*Math.cos(refLat*Math.PI/180)*R, y: -(dLat*R) };
   }
+  const boundaryM = boundary.points.map(p=>toM(p.lat,p.lng));
   const trailM = trailCoords.map(c=>toM(c[0],c[1]));
   const pointsM = points.map(p=>({...p, m:toM(p.lat,p.lng)}));
-  const all = trailM.concat(pointsM.map(p=>p.m));
+  const roadsM = roadFeatures.map(f=>({...f, m:f.coords.map(c=>toM(c[0],c[1]))}));
+
+  const all = boundaryM.concat(boundaryM.length?[]:trailM, pointsM.map(p=>p.m), ...roadsM.map(f=>f.m));
   const xs = all.map(p=>p.x), ys = all.map(p=>p.y);
   const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
   const spanX = Math.max(maxX-minX, 10), spanY = Math.max(maxY-minY, 10);
   const pad = 1.15;
   const mPerMm = Math.max(spanX*pad/drawW, spanY*pad/drawH);
-  const cx = (minX+maxX)/2, cy=(minY+maxY)/2;
+  const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
   function toPx(m){ return { x: drawW/2 + (m.x-cx)/mPerMm, y: drawH/2 + (m.y-cy)/mPerMm }; }
 
   let svgBody = '';
-  // outline path from walked trail
-  if(trailM.length>1){
+  // outline: prefer real boundary, fall back to walked trail
+  if(boundaryM.length>1){
+    const pts = boundaryM.map(m=>{ const p=toPx(m); return `${p.x.toFixed(2)},${p.y.toFixed(2)}`; }).join(' ');
+    svgBody += boundary.closed
+      ? `<polygon points="${pts}" fill="none" stroke="#000" stroke-width="0.7"/>`
+      : `<polyline points="${pts}" fill="none" stroke="#000" stroke-width="0.7"/>`;
+  } else if(trailM.length>1){
     const pts = trailM.map(m=>{ const p=toPx(m); return `${p.x.toFixed(2)},${p.y.toFixed(2)}`; }).join(' ');
     svgBody += `<polyline points="${pts}" fill="none" stroke="#000" stroke-width="0.5" stroke-dasharray="2,1.4"/>`;
   }
-  // symbols
+  // roads / walkways / streams
+  const roadDash = {road:'', walkway:'2,1.5', stream:'0.6,1.6'};
+  const roadWidth = {road:0.6, walkway:0.4, stream:0.4};
+  roadsM.forEach(f=>{
+    const pts = f.m.map(m=>{ const p=toPx(m); return `${p.x.toFixed(2)},${p.y.toFixed(2)}`; }).join(' ');
+    svgBody += `<polyline points="${pts}" fill="none" stroke="#000" stroke-width="${roadWidth[f.kind]||0.5}" ${roadDash[f.kind]?`stroke-dasharray="${roadDash[f.kind]}"`:''}/>`;
+  });
+  // building symbols
   pointsM.forEach(p=>{
     const s = toPx(p.m);
     svgBody += svgSymbol(p.type, s.x, s.y, 7);
@@ -482,17 +743,14 @@ function buildPrintView(){
     <text x="0" y="-3" font-size="3" font-family="monospace">${barMeters} m</text>
   </g>`;
 
-  const legendItems = SYMBOLS.map((sym,i)=>{
-    const lx = 6 + (i%3)*(drawW/3), ly = 8 + Math.floor(i/3)*13;
-    return `<g transform="translate(${lx},${ly})">${svgSymbolInline(sym,5)}<text x="10" y="1.8" font-size="3" font-family="monospace">${escapeXml(sym.label)}</text></g>`;
-  }).join('');
+  const legendItems = buildLegendSvg(drawW);
 
   const html = `
     <div style="width:${PAGE_W}mm; padding:${MARGIN}mm; font-family:sans-serif; box-sizing:border-box;">
       <div style="height:${HEADER_H}mm; border-bottom:0.5pt solid #000; margin-bottom:2mm; display:flex; justify-content:space-between; align-items:flex-end;">
         <div>
           <div style="font-size:14pt; font-weight:700;">Houselisting Block — Layout Map</div>
-          <div style="font-size:8pt; font-family:monospace;">Block ID: ${escapeXml(blockId||'—')} &nbsp;&nbsp; Buildings marked: ${points.length}</div>
+          <div style="font-size:8pt; font-family:monospace;">Block ID: ${escapeXml(blockId||'—')} &nbsp;&nbsp; Buildings: ${points.length} &nbsp;&nbsp; Outline: ${boundary.points.length>1 ? (boundary.closed?'Closed':'Open') : 'Not set'}</div>
         </div>
         <div style="font-size:8pt; font-family:monospace; text-align:right;">Generated ${new Date().toLocaleDateString()}<br>Census 2027 · HLB Field Mapper</div>
       </div>
@@ -504,6 +762,20 @@ function buildPrintView(){
       </div>
     </div>`;
   document.getElementById('printArea').innerHTML = html;
+}
+function buildLegendSvg(drawWv){
+  let out='';
+  SYMBOLS.forEach((sym,i)=>{
+    const lx = 6 + (i%3)*(drawWv/3), ly = 8 + Math.floor(i/3)*13;
+    out += `<g transform="translate(${lx},${ly})">${svgSymbolInline(sym,5)}<text x="10" y="1.8" font-size="3" font-family="monospace">${escapeXml(sym.label)}</text></g>`;
+  });
+  const lineLegend = [ {label:'Road', dash:'', w:0.6}, {label:'Walkway', dash:'2,1.5', w:0.4}, {label:'Stream', dash:'0.6,1.6', w:0.4} ];
+  lineLegend.forEach((ll,i)=>{
+    const idx = SYMBOLS.length+i;
+    const lx = 6 + (idx%3)*(drawWv/3), ly = 8 + Math.floor(idx/3)*13;
+    out += `<g transform="translate(${lx},${ly})"><line x1="0" y1="1" x2="8" y2="1" stroke="#000" stroke-width="${ll.w}" ${ll.dash?`stroke-dasharray="${ll.dash}"`:''}/><text x="11" y="2" font-size="3" font-family="monospace">${escapeXml(ll.label)}</text></g>`;
+  });
+  return out;
 }
 function escapeXml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function niceScaleMm(rough){ const steps=[1,2,5,10,20,50,100,200,500,1000,2000,5000]; return steps.reduce((a,b)=>Math.abs(b-rough)<Math.abs(a-rough)?b:a); }
