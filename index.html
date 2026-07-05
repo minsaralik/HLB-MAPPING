@@ -98,6 +98,14 @@
   .toast.show{opacity:1;}
   .leaflet-control-attribution{background:rgba(20,30,26,0.8) !important; color:var(--text-dim) !important; font-size:8px !important;}
   .leaflet-control-attribution a{color:var(--teal) !important;}
+
+  #printArea{display:none;}
+  @media print{
+    @page{ size: A3 portrait; margin: 10mm; }
+    body *{ visibility:hidden; }
+    #printArea, #printArea *{ visibility:visible; }
+    #printArea{ display:block !important; position:absolute; top:0; left:0; width:100%; }
+  }
 </style>
 </head>
 <body>
@@ -154,11 +162,13 @@
   <div class="sheet-actions" style="flex-direction:column;">
     <button class="btn-save" id="exportCsv" style="margin-bottom:8px;">Download CSV</button>
     <button class="btn-save" id="exportKml" style="margin-bottom:8px; background:var(--teal);">Download KML</button>
+    <button class="btn-save" id="exportPrint" style="margin-bottom:8px; background:var(--paper); color:#1a1408;">Print / Save as PDF (A3)</button>
     <button class="btn-cancel" id="closeExport">Close</button>
   </div>
 </div></div>
 
 <div class="toast" id="toast"></div>
+<div id="printArea"></div>
 
 <script>
 /* ================= Symbols (matches official HLB legend) ================= */
@@ -235,18 +245,31 @@ const liveIcon = L.divIcon({className:'', html:'<div class="pulse-dot"></div>', 
 /* ================= Storage ================= */
 async function loadBlock(id){
   points=[]; clearMarkers();
+  trailCoords=[]; if(trailLine){ map.removeLayer(trailLine); trailLine=null; }
   try{
     const res = await window.storage.get('hlb:'+id);
-    if(res && res.value){ points = JSON.parse(res.value).points || []; }
+    if(res && res.value){
+      const data = JSON.parse(res.value);
+      points = data.points || [];
+      trailCoords = data.trail || [];
+    }
   }catch(e){}
   points.forEach(addMarkerForPoint);
+  if(trailCoords.length>1){ trailLine = L.polyline(trailCoords,{color:'#e8a23d', weight:2, opacity:0.55}).addTo(map); }
   updateGpsCount();
   fitToPoints();
 }
 async function saveBlock(){
   if(!blockId) return;
-  try{ await window.storage.set('hlb:'+blockId, JSON.stringify({points})); }catch(e){ showToast('Save failed'); }
+  try{ await window.storage.set('hlb:'+blockId, JSON.stringify({points, trail:trailCoords})); }catch(e){ showToast('Save failed'); }
 }
+let lastSavedTrailLen = 0;
+setInterval(()=>{
+  if(blockId && trailCoords.length !== lastSavedTrailLen){
+    lastSavedTrailLen = trailCoords.length;
+    saveBlock();
+  }
+}, 15000);
 function clearMarkers(){ Object.values(pointMarkers).forEach(m=>map.removeLayer(m)); pointMarkers={}; }
 function fitToPoints(){
   if(points.length===0) return;
@@ -393,6 +416,113 @@ document.getElementById('exportKml').onclick=()=>{
   kml+='</Document></kml>';
   download((blockId||'hlb')+'_points.kml', kml, 'application/vnd.google-earth.kml+xml');
 };
+
+/* ================= Print / PDF (outline + markings only, no satellite) ================= */
+document.getElementById('exportPrint').onclick = ()=>{
+  if(points.length===0 && trailCoords.length===0){ showToast('Nothing to print yet'); return; }
+  buildPrintView();
+  document.getElementById('exportOverlay').classList.remove('open');
+  setTimeout(()=> window.print(), 150);
+};
+window.addEventListener('afterprint', ()=>{ document.getElementById('printArea').style.display='none'; });
+
+function buildPrintView(){
+  const PAGE_W = 297, PAGE_H = 420; // A3 portrait, mm
+  const MARGIN = 10;
+  const HEADER_H = 26, LEGEND_H = 34;
+  const drawW = PAGE_W - MARGIN*2;
+  const drawH = PAGE_H - MARGIN*2 - HEADER_H - LEGEND_H;
+
+  // reference origin = first available coordinate
+  const ref = (points[0] || trailCoords[0]);
+  if(!ref) return;
+  const refLat = Array.isArray(ref) ? ref[0] : ref.lat;
+  const refLng = Array.isArray(ref) ? ref[1] : ref.lng;
+  const R = 6378137;
+  function toM(lat,lng){
+    const dLat=(lat-refLat)*Math.PI/180, dLng=(lng-refLng)*Math.PI/180;
+    return { x: dLng*Math.cos(refLat*Math.PI/180)*R, y: -(dLat*R) };
+  }
+  const trailM = trailCoords.map(c=>toM(c[0],c[1]));
+  const pointsM = points.map(p=>({...p, m:toM(p.lat,p.lng)}));
+  const all = trailM.concat(pointsM.map(p=>p.m));
+  const xs = all.map(p=>p.x), ys = all.map(p=>p.y);
+  const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
+  const spanX = Math.max(maxX-minX, 10), spanY = Math.max(maxY-minY, 10);
+  const pad = 1.15;
+  const mPerMm = Math.max(spanX*pad/drawW, spanY*pad/drawH);
+  const cx = (minX+maxX)/2, cy=(minY+maxY)/2;
+  function toPx(m){ return { x: drawW/2 + (m.x-cx)/mPerMm, y: drawH/2 + (m.y-cy)/mPerMm }; }
+
+  let svgBody = '';
+  // outline path from walked trail
+  if(trailM.length>1){
+    const pts = trailM.map(m=>{ const p=toPx(m); return `${p.x.toFixed(2)},${p.y.toFixed(2)}`; }).join(' ');
+    svgBody += `<polyline points="${pts}" fill="none" stroke="#000" stroke-width="0.5" stroke-dasharray="2,1.4"/>`;
+  }
+  // symbols
+  pointsM.forEach(p=>{
+    const s = toPx(p.m);
+    svgBody += svgSymbol(p.type, s.x, s.y, 7);
+    svgBody += `<text x="${s.x.toFixed(2)}" y="${(s.y+11).toFixed(2)}" font-size="3.2" font-family="monospace" text-anchor="middle">${escapeXml(p.number)}</text>`;
+  });
+  // north arrow
+  svgBody += `<g transform="translate(${drawW-14},14)">
+    <polygon points="0,-7 3,4 0,1.5 -3,4" fill="#000"/>
+    <text x="0" y="12" font-size="4" text-anchor="middle" font-family="sans-serif" font-weight="bold">N</text>
+  </g>`;
+  // scale bar
+  const barMm = 40;
+  const barMeters = niceScaleMm(barMm*mPerMm);
+  const barPx = barMeters/mPerMm;
+  svgBody += `<g transform="translate(4,${drawH-8})">
+    <line x1="0" y1="0" x2="${barPx.toFixed(1)}" y2="0" stroke="#000" stroke-width="0.6"/>
+    <line x1="0" y1="-1.5" x2="0" y2="1.5" stroke="#000" stroke-width="0.6"/>
+    <line x1="${barPx.toFixed(1)}" y1="-1.5" x2="${barPx.toFixed(1)}" y2="1.5" stroke="#000" stroke-width="0.6"/>
+    <text x="0" y="-3" font-size="3" font-family="monospace">${barMeters} m</text>
+  </g>`;
+
+  const legendItems = SYMBOLS.map((sym,i)=>{
+    const lx = 6 + (i%3)*(drawW/3), ly = 8 + Math.floor(i/3)*13;
+    return `<g transform="translate(${lx},${ly})">${svgSymbolInline(sym,5)}<text x="10" y="1.8" font-size="3" font-family="monospace">${escapeXml(sym.label)}</text></g>`;
+  }).join('');
+
+  const html = `
+    <div style="width:${PAGE_W}mm; padding:${MARGIN}mm; font-family:sans-serif; box-sizing:border-box;">
+      <div style="height:${HEADER_H}mm; border-bottom:0.5pt solid #000; margin-bottom:2mm; display:flex; justify-content:space-between; align-items:flex-end;">
+        <div>
+          <div style="font-size:14pt; font-weight:700;">Houselisting Block — Layout Map</div>
+          <div style="font-size:8pt; font-family:monospace;">Block ID: ${escapeXml(blockId||'—')} &nbsp;&nbsp; Buildings marked: ${points.length}</div>
+        </div>
+        <div style="font-size:8pt; font-family:monospace; text-align:right;">Generated ${new Date().toLocaleDateString()}<br>Census 2027 · HLB Field Mapper</div>
+      </div>
+      <svg width="${drawW}mm" height="${drawH}mm" viewBox="0 0 ${drawW} ${drawH}" style="border:0.5pt solid #000;">
+        ${svgBody}
+      </svg>
+      <div style="height:${LEGEND_H}mm; margin-top:2mm; border-top:0.5pt solid #000; padding-top:2mm;">
+        <svg width="${drawW}mm" height="${LEGEND_H-4}mm" viewBox="0 0 ${drawW} ${LEGEND_H-4}">${legendItems}</svg>
+      </div>
+    </div>`;
+  document.getElementById('printArea').innerHTML = html;
+}
+function escapeXml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function niceScaleMm(rough){ const steps=[1,2,5,10,20,50,100,200,500,1000,2000,5000]; return steps.reduce((a,b)=>Math.abs(b-rough)<Math.abs(a-rough)?b:a); }
+function svgSymbol(type, cx, cy, s){
+  const black='#000';
+  if(type==='pucca_res') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
+  if(type==='pucca_nonres') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="0.5"/>` + hatchLines(cx-s/2,cy-s/2,s,s);
+  if(type==='kutcha_res') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
+  if(type==='kutcha_nonres') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="0.5"/>` + hatchLines(cx-s/2,cy-s*0.2,s,s*0.5);
+  if(type==='well') return `<circle cx="${cx}" cy="${cy}" r="${s/2.3}" fill="none" stroke="${black}" stroke-width="0.5"/><circle cx="${cx}" cy="${cy}" r="0.6" fill="${black}"/>`;
+  if(type==='landmark') return `<polygon points="${cx},${cy-s/1.8} ${cx+s/1.8},${cy} ${cx},${cy+s/1.8} ${cx-s/1.8},${cy}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
+  return '';
+}
+function svgSymbolInline(sym, s){ return svgSymbol(sym.id, s/2+1, s/2+1, s); }
+function hatchLines(x,y,w,h){
+  let l='';
+  for(let i=0;i<=w+h;i+=w/3){ l+=`<line x1="${x+Math.max(0,i-h)}" y1="${y+Math.min(i,h)}" x2="${x+Math.min(i,w)}" y2="${y+Math.max(0,i-w)}" stroke="#000" stroke-width="0.3"/>`; }
+  return `<g clip-path="url(#clip)">${l}</g>`;
+}
 
 /* ================= Toast ================= */
 let toastTimer;
