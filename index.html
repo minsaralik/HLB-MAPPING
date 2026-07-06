@@ -271,6 +271,26 @@ let mode=null; // null | 'boundary-walk' | 'boundary-coords' | 'road-draw'
 let boundaryDraft=[], boundaryDraftLine=null, boundaryVertexMarkers=[], boundaryWalkTimer=null, boundaryClickHandler=null;
 let roadDraftCoords=[], roadDraftLine=null, roadSelectedKind='road', roadClickHandlerRef=null;
 
+/* ================= Local persistence (works on any real website, unlike window.storage) ================= */
+function storageGet(key){
+  try{ const v = localStorage.getItem(key); return Promise.resolve(v===null ? null : {key, value:v}); }
+  catch(e){ return Promise.reject(e); }
+}
+function storageSet(key, value){
+  try{ localStorage.setItem(key, value); return Promise.resolve({key, value}); }
+  catch(e){ return Promise.reject(e); }
+}
+function attachTapHandler(el, handler){
+  let downPos=null;
+  el.onpointerdown = (e)=>{ downPos = {x:e.clientX, y:e.clientY}; };
+  el.onpointerup = (e)=>{
+    if(!downPos) return;
+    const moved = Math.hypot(e.clientX-downPos.x, e.clientY-downPos.y);
+    downPos=null;
+    if(moved < 12) handler({offsetX:e.offsetX, offsetY:e.offsetY});
+  };
+}
+
 /* ================= Map init (free basemaps, no API key) ================= */
 const esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
   maxZoom:20, attribution:'Esri, Maxar, Earthstar Geographics'
@@ -310,7 +330,7 @@ async function loadBlock(id){
   roadFeatures=[]; clearRoadLayers();
   Object.values(warningRings).forEach(w=>map.removeLayer(w)); warningRings={};
   try{
-    const res = await window.storage.get('hlb:'+id);
+    const res = await storageGet('hlb:'+id);
     if(res && res.value){
       const data = JSON.parse(res.value);
       points = data.points || [];
@@ -329,7 +349,7 @@ async function loadBlock(id){
 }
 async function saveBlock(){
   if(!blockId) return;
-  try{ await window.storage.set('hlb:'+blockId, JSON.stringify({points, trail:trailCoords, boundary, roads:roadFeatures})); }catch(e){ showToast('Save failed'); }
+  try{ await storageSet('hlb:'+blockId, JSON.stringify({points, trail:trailCoords, boundary, roads:roadFeatures})); }catch(e){ showToast('Save failed'); }
 }
 let lastSavedTrailLen = 0;
 setInterval(()=>{
@@ -898,7 +918,7 @@ function goToCalibrateStep(){
   document.getElementById('impSub').textContent='Tap a landmark you can identify (road junction, building corner), then enter its real coordinates. Repeat for a second point — the further from the first, the more accurate.';
   document.getElementById('impActions').innerHTML='<button class="btn-cancel" id="impCancelBtn1">Cancel</button>';
   document.getElementById('impCancelBtn1').onclick=closeImportFlow;
-  document.getElementById('refImgEl').onclick = onCalibClick;
+  attachTapHandler(document.getElementById('refImgEl'), onCalibClick);
   renderCalibList();
 }
 function onCalibClick(e){
@@ -966,15 +986,19 @@ function goToTraceStep(){
     <button class="btn-save" id="impTraceFinish" style="flex:1 1 100%;">Close &amp; Save Outline</button>
     <button class="btn-cancel" id="impCancelBtn2">Cancel</button>`;
   document.getElementById('impCancelBtn2').onclick=closeImportFlow;
-  document.getElementById('impTraceUndo').onclick=()=>{ traceDraft.pop(); redrawCalibSvg(); };
+  document.getElementById('impTraceUndo').onclick=()=>{ traceDraft.pop(); updateTraceCounter(); redrawCalibSvg(); };
   document.getElementById('impTraceFinish').onclick=finishImageTrace;
   document.getElementById('impAutoDetect').onclick=()=>{
     if(!offCanvas) prepareOffscreenCanvas();
     awaitingAutoSeed=true;
     showToast('Now tap once directly on the boundary line');
   };
-  document.getElementById('refImgEl').onclick = onTraceClick;
+  attachTapHandler(document.getElementById('refImgEl'), onTraceClick);
+  updateTraceCounter();
   redrawCalibSvg();
+}
+function updateTraceCounter(){
+  document.getElementById('calibPointsList').innerHTML = `<strong style="color:var(--amber); font-size:12px;">Boundary points marked: ${traceDraft.length}</strong>`;
 }
 function prepareOffscreenCanvas(){
   offCanvas = document.createElement('canvas');
@@ -1075,6 +1099,7 @@ function onTraceClick(e){
         if(Math.hypot(a.x-b.x,a.y-b.y) < 6) simplified = simplified.slice(0,-1);
       }
       traceDraft = simplified.map(p=>({px:p.x, py:p.y}));
+      updateTraceCounter();
       redrawCalibSvg();
       showToast('Auto-detected '+traceDraft.length+' points — review, then Save (edit further anytime with the EDIT button)');
     }, 50);
@@ -1085,6 +1110,7 @@ function onTraceClick(e){
     if(d < (18/currentZoom)){ finishImageTrace(); return; }
   }
   traceDraft.push({px,py});
+  updateTraceCounter();
   redrawCalibSvg();
 }
 function redrawCalibSvg(){
@@ -1094,8 +1120,8 @@ function redrawCalibSvg(){
   if(pendingCalibPx){ s+=`<circle cx="${pendingCalibPx.px}" cy="${pendingCalibPx.py}" r="${8/currentZoom}" fill="none" stroke="#e8a23d" stroke-width="${2/currentZoom}"/>`; }
   if(importStep==='trace' && traceDraft.length){
     const pts = traceDraft.map(p=>`${p.px},${p.py}`).join(' ');
-    s += `<polyline points="${pts}" fill="none" stroke="#ff5a5a" stroke-width="${3/currentZoom}"/>`;
-    traceDraft.forEach(p=>{ s+=`<circle cx="${p.px}" cy="${p.py}" r="${5/currentZoom}" fill="#ff5a5a"/>`; });
+    s += `<polyline points="${pts}" fill="none" stroke="#ff5a5a" stroke-width="${4/currentZoom}"/>`;
+    traceDraft.forEach((p,i)=>{ s+=`<circle cx="${p.px}" cy="${p.py}" r="${8/currentZoom}" fill="#ff5a5a" stroke="#fff" stroke-width="${2/currentZoom}"/><text x="${p.px}" y="${p.py-12/currentZoom}" fill="#fff" font-size="${13/currentZoom}" font-family="monospace" text-anchor="middle" font-weight="bold">${i+1}</text>`; });
   }
   svg.innerHTML = s;
 }
@@ -1197,13 +1223,13 @@ function showToast(msg){ const t=document.getElementById('toast'); t.textContent
 const blockInput=document.getElementById('blockId');
 blockInput.addEventListener('change', async ()=>{
   blockId=blockInput.value.trim();
-  if(blockId){ await loadBlock(blockId); try{ await window.storage.set('hlb:lastBlock', blockId); }catch(e){} showToast('Loaded block: '+blockId); }
+  if(blockId){ await loadBlock(blockId); try{ await storageSet('hlb:lastBlock', blockId); }catch(e){} showToast('Loaded block: '+blockId); }
 });
 
 /* ================= Init ================= */
 (async function init(){
   try{
-    const last = await window.storage.get('hlb:lastBlock');
+    const last = await storageGet('hlb:lastBlock');
     if(last && last.value){ blockInput.value=last.value; blockId=last.value; await loadBlock(blockId); }
   }catch(e){}
   startGps();
