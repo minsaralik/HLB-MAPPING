@@ -294,20 +294,115 @@ let map, liveMarker, accCircle, trailLine, trailCoords=[], pointMarkers={}, warn
 let boundary={points:[], closed:false, method:null}, boundaryLayer=null;
 let roadFeatures=[], roadLayers={};
 let mode=null; // null | 'boundary-walk' | 'boundary-coords' | 'road-draw' | 'place-building' | 'road-edit'
-let pendingMarkLatLng=null, editingRoadId=null, roadEditMarkers=[], roadEditOriginalCoords=null;
+let pendingMarkLatLng=null, editingRoadId=null, roadEditMarkers=[], roadEditOriginalCoords=null, roadEditOriginalKind=null;
 let boundaryDraft=[], boundaryDraftLine=null, boundaryVertexMarkers=[], boundaryWalkTimer=null, boundaryClickHandler=null;
 let roadDraftCoords=[], roadDraftLine=null, roadSelectedKind='road', roadClickHandlerRef=null;
 let ambientTrailOn=true;
 let roadWalkRecording=false, roadWalkCoords=[], roadWalkLine=null, roadWalkKind='road';
 
-/* ================= Local persistence (works on any real website, unlike window.storage) ================= */
-function storageGet(key){
-  try{ const v = localStorage.getItem(key); return Promise.resolve(v===null ? null : {key, value:v}); }
-  catch(e){ return Promise.reject(e); }
+/* ================= IndexedDB persistence (larger and safer than localStorage) ================= */
+const DB_NAME = 'hlb-field-mapper-db';
+const DB_VERSION = 1;
+const DB_STORE = 'kv';
+let dbPromise = null;
+
+function openHlbDb(){
+  if(dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject)=>{
+    if(!('indexedDB' in window)){
+      reject(new Error('IndexedDB not supported'));
+      return;
+    }
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e)=>{
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, {keyPath:'key'});
+    };
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error || new Error('IndexedDB open failed'));
+  });
+  return dbPromise;
 }
-function storageSet(key, value){
-  try{ localStorage.setItem(key, value); return Promise.resolve({key, value}); }
-  catch(e){ return Promise.reject(e); }
+
+async function storageGet(key){
+  try{
+    const db = await openHlbDb();
+    const value = await new Promise((resolve,reject)=>{
+      const tx = db.transaction(DB_STORE,'readonly');
+      const store = tx.objectStore(DB_STORE);
+      const req = store.get(key);
+      req.onsuccess = ()=> resolve(req.result ? req.result.value : null);
+      req.onerror = ()=> reject(req.error);
+    });
+    if(value !== null && value !== undefined) return {key, value};
+  }catch(e){
+    console.warn('IndexedDB read failed, trying localStorage fallback', e);
+  }
+
+  // Fallback + migration support for older versions of this app.
+  try{
+    const v = localStorage.getItem(key);
+    if(v !== null){
+      try{ await storageSet(key, v); }catch(e){}
+      return {key, value:v};
+    }
+  }catch(e){}
+  return null;
+}
+
+async function storageSet(key, value){
+  try{
+    const db = await openHlbDb();
+    await new Promise((resolve,reject)=>{
+      const tx = db.transaction(DB_STORE,'readwrite');
+      const store = tx.objectStore(DB_STORE);
+      const req = store.put({key, value, updatedAt:new Date().toISOString()});
+      req.onerror = ()=> reject(req.error);
+      tx.oncomplete = ()=> resolve();
+      tx.onerror = ()=> reject(tx.error || req.error);
+    });
+    return {key, value};
+  }catch(e){
+    // Last-resort fallback for old/limited browsers.
+    try{ localStorage.setItem(key, value); return {key, value}; }
+    catch(e2){ throw e; }
+  }
+}
+
+async function storageList(prefix){
+  const out = [];
+  try{
+    const db = await openHlbDb();
+    await new Promise((resolve,reject)=>{
+      const tx = db.transaction(DB_STORE,'readonly');
+      const store = tx.objectStore(DB_STORE);
+      const req = store.openCursor();
+      req.onsuccess = (e)=>{
+        const cursor = e.target.result;
+        if(cursor){
+          const row = cursor.value;
+          if(row && row.key && row.key.startsWith(prefix)) out.push({key:row.key, value:row.value});
+          cursor.continue();
+        }
+      };
+      req.onerror = ()=> reject(req.error);
+      tx.oncomplete = ()=> resolve();
+      tx.onerror = ()=> reject(tx.error || req.error);
+    });
+  }catch(e){
+    console.warn('IndexedDB list failed, trying localStorage fallback', e);
+  }
+
+  // Include old localStorage entries that may not be migrated yet.
+  try{
+    for(let i=0;i<localStorage.length;i++){
+      const key = localStorage.key(i);
+      if(key && key.startsWith(prefix) && !out.some(x=>x.key===key)){
+        out.push({key, value:localStorage.getItem(key)});
+      }
+    }
+  }catch(e){}
+  return out;
 }
 function attachTapHandler(el, handler){
   let downPos=null;
@@ -448,9 +543,11 @@ function renderRoadFeature(f){
   roadLayers[f.id] = layer;
 }
 function renderAllRoads(){ clearRoadLayers(); roadFeatures.forEach(renderRoadFeature); }
+function lineLabel(kind){ return kind==='walkway' ? 'Walkway' : (kind==='stream' ? 'Stream' : 'Road'); }
 function openRoadPopup(f){
   const layer=roadLayers[f.id]; if(!layer) return;
-  layer.bindPopup(`<div class="popup-num">${f.kind||'road'}</div><div class="popup-meta">${f.coords.length} points</div><button class="popup-del" id="roadEditBtn">Edit shape</button><button class="popup-del" id="roadDeleteBtn" style="margin-left:6px;">Delete</button>`).openPopup();
+  const label = lineLabel(f.kind);
+  layer.bindPopup(`<div class="popup-num">${label}</div><div class="popup-meta">${f.coords.length} points · tap Edit to reshape/change type</div><button class="popup-del" id="roadEditBtn">Edit</button><button class="popup-del" id="roadDeleteBtn" style="margin-left:6px;">Delete</button>`).openPopup();
   setTimeout(()=>{
     const e=document.getElementById('roadEditBtn'), d=document.getElementById('roadDeleteBtn');
     if(e) e.onclick=()=>startRoadEdit(f.id);
@@ -458,47 +555,118 @@ function openRoadPopup(f){
   },0);
 }
 function deleteRoadFeature(id){
+  const f=roadFeatures.find(r=>r.id===id);
+  const label=lineLabel(f && f.kind);
+  if(!confirm('Delete this '+label.toLowerCase()+'?')) return;
   const layer=roadLayers[id]; if(layer) map.removeLayer(layer);
-  delete roadLayers[id]; roadFeatures=roadFeatures.filter(r=>r.id!==id); saveBlock(); showToast('Road deleted');
+  delete roadLayers[id]; roadFeatures=roadFeatures.filter(r=>r.id!==id); saveBlock(); showToast(label+' deleted');
 }
 function startRoadEdit(id){
   finishRoadDrawMode(); cancelRoadEdit(false);
   const f=roadFeatures.find(r=>r.id===id); if(!f) return;
-  editingRoadId=id; roadEditOriginalCoords=f.coords.map(c=>[c[0],c[1]]); mode='road-edit';
+  editingRoadId=id; roadEditOriginalCoords=f.coords.map(c=>[c[0],c[1]]); roadEditOriginalKind=f.kind; mode='road-edit';
   if(roadLayers[id]) roadLayers[id].closePopup();
-  showBanner('Editing road — drag points to reshape.', `<button class="primary" id="reSave">Save Shape</button><button class="danger" id="reDelete">Delete Road</button><button id="reCancel">Cancel</button>`);
+  renderRoadEditBanner(f);
+  rebuildRoadEditMarkers();
+}
+function renderRoadEditBanner(f){
+  showBanner('Editing '+lineLabel(f.kind).toLowerCase()+' — drag points to reshape.',
+    `<button class="primary" id="reSave">Save</button><button id="reAdd">Add Point</button><button class="danger" id="reDelete">Delete</button><button id="reCancel">Cancel</button>`,
+    `<div class="chip-row">
+      <button class="chip ${f.kind==='road'?'selected':''}" id="reTypeRoad">Road</button>
+      <button class="chip ${f.kind==='walkway'?'selected':''}" id="reTypeWalk">Walkway</button>
+      <button class="chip ${f.kind==='stream'?'selected':''}" id="reTypeStream">Stream</button>
+    </div><div class="db-label" style="color:var(--text-dim);font-size:9px;">Tip: tap Add Point, then tap inside the boundary to insert a new vertex. Long-press a point to remove it.</div>`);
   document.getElementById('reSave').onclick=saveRoadEdit;
-  document.getElementById('reDelete').onclick=()=>{ deleteRoadFeature(id); cancelRoadEdit(false); };
+  document.getElementById('reDelete').onclick=()=>{ const id=f.id; cancelRoadEdit(false); deleteRoadFeature(id); };
   document.getElementById('reCancel').onclick=()=>cancelRoadEdit(true);
+  document.getElementById('reTypeRoad').onclick=()=>changeEditingLineType('road');
+  document.getElementById('reTypeWalk').onclick=()=>changeEditingLineType('walkway');
+  document.getElementById('reTypeStream').onclick=()=>changeEditingLineType('stream');
+  document.getElementById('reAdd').onclick=enableRoadVertexAdd;
+}
+function changeEditingLineType(kind){
+  const f=roadFeatures.find(r=>r.id===editingRoadId); if(!f) return;
+  f.kind=kind;
+  if(roadLayers[f.id]) roadLayers[f.id].setStyle(roadStyle(kind));
+  renderRoadEditBanner(f);
+  showToast('Changed to '+lineLabel(kind));
+}
+function rebuildRoadEditMarkers(){
+  roadEditMarkers.forEach(m=>map.removeLayer(m)); roadEditMarkers=[];
+  const f=roadFeatures.find(r=>r.id===editingRoadId); if(!f) return;
   const vertexIcon=L.divIcon({className:'', html:'<div class="edit-vertex"></div>', iconSize:[14,14], iconAnchor:[7,7]});
   roadEditMarkers = f.coords.map((c,idx)=>{
     const m=L.marker(c,{icon:vertexIcon, draggable:true, zIndexOffset:1200}).addTo(map);
+    let pressTimer=null;
+    m.on('mousedown touchstart',()=>{ pressTimer=setTimeout(()=>removeEditingRoadVertex(idx),650); });
+    m.on('mouseup mouseout touchend',()=>{ if(pressTimer) clearTimeout(pressTimer); });
     m.on('drag',()=>{
+      if(pressTimer) clearTimeout(pressTimer);
       const ll=m.getLatLng();
       if(hasActiveBoundary() && !isInsideBoundary(ll.lat,ll.lng)){ warnOutOfBoundary(); return; }
-      f.coords[idx]=[ll.lat,ll.lng]; if(roadLayers[id]) roadLayers[id].setLatLngs(f.coords);
+      f.coords[idx]=[ll.lat,ll.lng]; if(roadLayers[f.id]) roadLayers[f.id].setLatLngs(f.coords);
     });
     m.on('dragend',()=>{
       const ll=m.getLatLng();
       if(hasActiveBoundary() && !isInsideBoundary(ll.lat,ll.lng)){
         m.setLatLng(f.coords[idx]); warnOutOfBoundary();
       } else { f.coords[idx]=[ll.lat,ll.lng]; }
-      if(roadLayers[id]) roadLayers[id].setLatLngs(f.coords);
+      if(roadLayers[f.id]) roadLayers[f.id].setLatLngs(f.coords);
     });
     return m;
   });
 }
+function removeEditingRoadVertex(idx){
+  const f=roadFeatures.find(r=>r.id===editingRoadId); if(!f) return;
+  if(f.coords.length<=2){ showToast('A line needs at least 2 points'); return; }
+  f.coords.splice(idx,1);
+  if(roadLayers[f.id]) roadLayers[f.id].setLatLngs(f.coords);
+  rebuildRoadEditMarkers();
+  showToast('Point removed');
+}
+function enableRoadVertexAdd(){
+  showToast('Tap the line area to add a point');
+  const once=(e)=>{
+    map.off('click', once);
+    const f=roadFeatures.find(r=>r.id===editingRoadId); if(!f) return;
+    if(hasActiveBoundary() && !isInsideBoundary(e.latlng.lat,e.latlng.lng)){ warnOutOfBoundary(); return; }
+    const insertAt = nearestSegmentIndex(f.coords, [e.latlng.lat,e.latlng.lng]) + 1;
+    f.coords.splice(insertAt,0,[e.latlng.lat,e.latlng.lng]);
+    if(roadLayers[f.id]) roadLayers[f.id].setLatLngs(f.coords);
+    rebuildRoadEditMarkers();
+    showToast('Point added');
+  };
+  map.on('click', once);
+}
+function nearestSegmentIndex(coords, latlng){
+  if(coords.length<2) return 0;
+  const p=map.latLngToLayerPoint(latlng); let best=0, bestDist=Infinity;
+  for(let i=0;i<coords.length-1;i++){
+    const a=map.latLngToLayerPoint(coords[i]), b=map.latLngToLayerPoint(coords[i+1]);
+    const d=pointSegmentDistance(p,a,b);
+    if(d<bestDist){ bestDist=d; best=i; }
+  }
+  return best;
+}
+function pointSegmentDistance(p,a,b){
+  const dx=b.x-a.x, dy=b.y-a.y;
+  if(dx===0 && dy===0) return Math.hypot(p.x-a.x,p.y-a.y);
+  let t=((p.x-a.x)*dx+(p.y-a.y)*dy)/(dx*dx+dy*dy); t=Math.max(0,Math.min(1,t));
+  const x=a.x+t*dx, y=a.y+t*dy; return Math.hypot(p.x-x,p.y-y);
+}
 function saveRoadEdit(){
   const f=roadFeatures.find(r=>r.id===editingRoadId);
   if(f && !boundaryContainsLine(f.coords)){ warnOutOfBoundary(); return; }
-  saveBlock(); roadEditOriginalCoords=null; cancelRoadEdit(false); showToast('Road shape saved');
+  const label=lineLabel(f && f.kind);
+  saveBlock(); roadEditOriginalCoords=null; cancelRoadEdit(false); showToast(label+' saved');
 }
 function cancelRoadEdit(redraw){
   if(redraw && editingRoadId && roadEditOriginalCoords){
     const f=roadFeatures.find(r=>r.id===editingRoadId);
-    if(f){ f.coords=roadEditOriginalCoords.map(c=>[c[0],c[1]]); }
+    if(f){ f.coords=roadEditOriginalCoords.map(c=>[c[0],c[1]]); f.kind=roadEditOriginalKind||f.kind; if(roadLayers[f.id]){ roadLayers[f.id].setLatLngs(f.coords); roadLayers[f.id].setStyle(roadStyle(f.kind)); } }
   }
-  roadEditMarkers.forEach(m=>map.removeLayer(m)); roadEditMarkers=[]; editingRoadId=null; roadEditOriginalCoords=null;
+  roadEditMarkers.forEach(m=>map.removeLayer(m)); roadEditMarkers=[]; editingRoadId=null; roadEditOriginalCoords=null; roadEditOriginalKind=null;
   if(mode==='road-edit') mode=null;
   if(redraw) renderAllRoads();
   hideBanner();
@@ -1429,14 +1597,15 @@ function exitBoundaryEditMode(){
 }
 
 /* ================= Full backup export/import (for transferring between phones) ================= */
-document.getElementById('exportBackup').onclick=()=>{
-  const backup = {app:'hlb-field-mapper', exportedAt:new Date().toISOString(), blocks:{}};
-  for(let i=0;i<localStorage.length;i++){
-    const key = localStorage.key(i);
+document.getElementById('exportBackup').onclick=async ()=>{
+  const backup = {app:'hlb-field-mapper', storage:'indexeddb', exportedAt:new Date().toISOString(), blocks:{}};
+  const rows = await storageList('hlb:');
+  rows.forEach(row=>{
+    const key = row.key;
     if(key && key.startsWith('hlb:') && key!=='hlb:lastBlock'){
-      try{ backup.blocks[key.slice(4)] = JSON.parse(localStorage.getItem(key)); }catch(e){}
+      try{ backup.blocks[key.slice(4)] = JSON.parse(row.value); }catch(e){}
     }
-  }
+  });
   const count = Object.keys(backup.blocks).length;
   if(count===0){ showToast('No saved blocks to back up yet'); return; }
   download('hlb_backup_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(backup), 'application/json');
