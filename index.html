@@ -1143,16 +1143,29 @@ function buildPrintView(){
     const pts = f.m.map(m=>{ const p=toPx(m); return `${p.x.toFixed(2)},${p.y.toFixed(2)}`; }).join(' ');
     svgBody += `<polyline points="${pts}" fill="none" stroke="#000" stroke-width="${roadWidth[f.kind]||0.5}" ${roadDash[f.kind]?`stroke-dasharray="${roadDash[f.kind]}"`:''}/>`;
   });
-  // building symbols
-  pointsM.forEach(p=>{
-    const s = toPx(p.m);
-    svgBody += svgSymbol(p.type, s.x, s.y, 7);
+  // building symbols — one uniform size, computed so the closest two buildings' squares
+  // never overlap, without shifting any symbol away from its true coordinate
+  const screenPts = pointsM.map(p=>toPx(p.m));
+  let minDist = Infinity;
+  for(let i=0;i<screenPts.length;i++){
+    for(let j=i+1;j<screenPts.length;j++){
+      const d = Math.hypot(screenPts[i].x-screenPts[j].x, screenPts[i].y-screenPts[j].y);
+      if(d<minDist) minDist=d;
+    }
+  }
+  if(!isFinite(minDist)) minDist = 14;
+  const symbolSize = Math.max(2.2, Math.min(7, minDist*0.8));
+  pointsM.forEach((p,idx)=>{
+    const s = screenPts[idx];
+    svgBody += svgSymbol(p.type, s.x, s.y, symbolSize);
     if(p.number){
       const tx = escapeXml(p.number);
-      const inside = tx.length<=4;
-      svgBody += inside
-        ? `<text x="${s.x.toFixed(2)}" y="${(s.y+1.1).toFixed(2)}" font-size="2.2" font-family="monospace" text-anchor="middle">${tx}</text>`
-        : `<text x="${s.x.toFixed(2)}" y="${(s.y+10.5).toFixed(2)}" font-size="2.8" font-family="monospace" text-anchor="middle">${tx}</text>`;
+      const fitsInside = tx.length<=4 && symbolSize>=3.4;
+      const insideFont = Math.max(1.4, symbolSize*0.32);
+      const belowFont = Math.max(1.8, symbolSize*0.4);
+      svgBody += fitsInside
+        ? `<text x="${s.x.toFixed(2)}" y="${(s.y+insideFont*0.45).toFixed(2)}" font-size="${insideFont.toFixed(2)}" font-family="monospace" text-anchor="middle">${tx}</text>`
+        : `<text x="${s.x.toFixed(2)}" y="${(s.y+symbolSize*0.75+belowFont).toFixed(2)}" font-size="${belowFont.toFixed(2)}" font-family="monospace" text-anchor="middle">${tx}</text>`;
     }
   });
   // north arrow
