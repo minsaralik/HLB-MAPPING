@@ -244,7 +244,8 @@
     <button class="btn-save" id="exportKml" style="margin-bottom:8px; background:var(--teal);">Download KML</button>
     <button class="btn-save" id="exportPrint" style="margin-bottom:8px; background:var(--paper); color:#1a1408;">Print / Save as PDF (A3)</button>
     <button class="btn-save" id="exportBackup" style="margin-bottom:8px; background:#8a7fd6;">Export Full Backup (All Blocks)</button>
-    <div class="field" style="margin-top:4px;"><label>Import Backup File (from another phone)</label><input type="file" id="importBackupInput" accept="application/json"></div>
+    <div class="field" style="margin-top:4px;"><label>Import Backup File (from another phone)</label><input type="file" id="importBackupInput" accept=".json,application/json"></div>
+    <div id="backupPreview" style="display:none; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:8px; font-family:var(--font-mono); font-size:11px;"></div>
     <button class="btn-cancel" id="closeExport">Close</button>
   </div>
 </div></div>
@@ -1185,15 +1186,27 @@ function buildPrintView(){
   // Symbol size is now grounded in real-world scale: each box represents a fixed
   // physical footprint (in meters), converted using the exact same meters-per-mm
   // as the printed scale bar — so the size is always true to scale, not a guess.
-  const FOOTPRINT_METERS = 2.5; // adjust this single number if boxes look too big/small in practice
-  const symbolSize = Math.max(1, Math.min(8, (FOOTPRINT_METERS * 0.75) / mPerMm));
-  pointsM.forEach((p,idx)=>{ svgBody += svgSymbol(p.type, screenPts[idx].x, screenPts[idx].y, symbolSize); });
+  const FOOTPRINT_METERS = 3.2; // adjust this single number if boxes look too big/small in practice
+  const symbolSize = Math.max(2.2, Math.min(8, (FOOTPRINT_METERS * 0.8) / mPerMm));
+  const baseSize = symbolSize;
+  const minFont = 1.3, maxFont = Math.max(1.6, baseSize*0.34);
+  // Decide each point's box size: single labels must fit inside, so the box only
+  // grows beyond the uniform base size when even the smallest legible font won't fit.
+  // Comma-separated multi-labels (e.g. "371/1,2,3") keep the standard size and are
+  // labeled outside instead — trying to cram several house numbers into one tiny
+  // box is what caused the unreadable clumps before.
+  const renderSizes = pointsM.map(p=>{
+    const tx = p.number||'';
+    if(!tx || tx.includes(',')) return baseSize;
+    const widthAtMin = tx.length*minFont*0.62;
+    if(widthAtMin <= baseSize*0.82) return baseSize;
+    return Math.min(10, Math.max(baseSize, widthAtMin/0.82));
+  });
+  pointsM.forEach((p,idx)=>{ svgBody += svgSymbol(p.type, screenPts[idx].x, screenPts[idx].y, renderSizes[idx]); });
 
-  // ---- Label placement: keep every symbol at its true position/size, but if a
-  // label would collide with a neighboring symbol or label, nudge just the TEXT
-  // to the nearest open spot and draw a thin leader line back to the real point.
+  // ---- Label placement ----
   function boxesOverlap(a,b){ return !(a.x2<b.x1 || a.x1>b.x2 || a.y2<b.y1 || a.y1>b.y2); }
-  const symbolBoxes = screenPts.map(s=>({x1:s.x-symbolSize/2, y1:s.y-symbolSize/2, x2:s.x+symbolSize/2, y2:s.y+symbolSize/2}));
+  const symbolBoxes = screenPts.map((s,idx)=>{ const sz=renderSizes[idx]; return {x1:s.x-sz/2, y1:s.y-sz/2, x2:s.x+sz/2, y2:s.y+sz/2}; });
   const placedLabelBoxes = [];
   function collides(box, skipIdx){
     for(let i=0;i<symbolBoxes.length;i++){ if(i!==skipIdx && boxesOverlap(box,symbolBoxes[i])) return true; }
@@ -1204,16 +1217,17 @@ function buildPrintView(){
     if(!p.number) return;
     const s = screenPts[idx];
     const tx = escapeXml(p.number);
-    const fitsInside = tx.length<=4 && symbolSize>=3.4;
-    if(fitsInside){
-      const insideFont = Math.max(1.4, symbolSize*0.32);
-      svgBody += `<text x="${s.x.toFixed(2)}" y="${(s.y+insideFont*0.45).toFixed(2)}" font-size="${insideFont.toFixed(2)}" font-family="monospace" text-anchor="middle">${tx}</text>`;
+    const sz = renderSizes[idx];
+    const isMulti = p.number.includes(',');
+    if(!isMulti){
+      const font = Math.min(maxFont, Math.max(minFont, (sz*0.82)/(p.number.length*0.62)));
+      svgBody += `<text x="${s.x.toFixed(2)}" y="${(s.y+font*0.35).toFixed(2)}" font-size="${font.toFixed(2)}" font-family="monospace" text-anchor="middle">${tx}</text>`;
       return;
     }
-    const fontSize = Math.max(1.8, symbolSize*0.4);
+    // multi-number label: goes outside the box, with a leader line if it has to move to avoid a collision
+    const fontSize = Math.max(1.8, baseSize*0.4);
     const labelW = tx.length*fontSize*0.62, labelH = fontSize*1.15;
-    const gap = symbolSize*0.75 + 0.9;
-    // candidate positions: default straight below first, then a ring of alternatives
+    const gap = sz*0.75 + 0.9;
     const candidates = [{dx:0, dy:gap}];
     const ringDists = [gap, gap+2.2, gap+4.4, gap+7];
     const angles = [90,45,135,0,180,270,315,225,60,120,300,240];
@@ -1286,20 +1300,28 @@ function escapeXml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
 function niceScaleMm(rough){ const steps=[1,2,5,10,20,50,100,200,500,1000,2000,5000]; return steps.reduce((a,b)=>Math.abs(b-rough)<Math.abs(a-rough)?b:a); }
 function svgSymbol(type, cx, cy, s){
   const black='#000';
-  if(type==='pucca_res') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
-  if(type==='pucca_nonres') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="0.5"/>` + hatchLines(cx-s/2,cy-s/2,s,s);
-  if(type==='kutcha_res') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
-  if(type==='kutcha_nonres') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="0.5"/>` + hatchLines(cx-s/2,cy-s*0.2,s,s*0.5);
-  if(type==='multi_unit') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="0.5"/><line x1="${cx}" y1="${cy-s/2}" x2="${cx}" y2="${cy+s/2}" stroke="${black}" stroke-width="0.35"/><line x1="${cx-s/2}" y1="${cy}" x2="${cx+s/2}" y2="${cy}" stroke="${black}" stroke-width="0.35"/>`;
-  if(type==='well') return `<circle cx="${cx}" cy="${cy}" r="${s/2.3}" fill="none" stroke="${black}" stroke-width="0.5"/><circle cx="${cx}" cy="${cy}" r="0.6" fill="${black}"/>`;
-  if(type==='landmark') return `<polygon points="${cx},${cy-s/1.8} ${cx+s/1.8},${cy} ${cx},${cy+s/1.8} ${cx-s/1.8},${cy}" fill="none" stroke="${black}" stroke-width="0.5"/>`;
+  const bw = Math.max(0.12, s*0.045).toFixed(2); // border width scales with box size — stays light even when small
+  if(type==='pucca_res') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="${bw}"/>`;
+  if(type==='pucca_nonres') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="${bw}"/>` + hatchLines(cx-s/2,cy-s/2,s,s,s);
+  if(type==='kutcha_res') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="${bw}"/>`;
+  if(type==='kutcha_nonres') return `<polygon points="${cx},${cy-s*0.55} ${cx+s*0.55},${cy+s*0.4} ${cx-s*0.55},${cy+s*0.4}" fill="none" stroke="${black}" stroke-width="${bw}"/>` + hatchLines(cx-s/2,cy-s*0.2,s,s*0.5,s);
+  if(type==='multi_unit') return `<rect x="${cx-s/2}" y="${cy-s/2}" width="${s}" height="${s}" fill="none" stroke="${black}" stroke-width="${bw}"/><line x1="${cx}" y1="${cy-s/2}" x2="${cx}" y2="${cy+s/2}" stroke="${black}" stroke-width="${bw}"/><line x1="${cx-s/2}" y1="${cy}" x2="${cx+s/2}" y2="${cy}" stroke="${black}" stroke-width="${bw}"/>`;
+  if(type==='well') return `<circle cx="${cx}" cy="${cy}" r="${s/2.3}" fill="none" stroke="${black}" stroke-width="${bw}"/><circle cx="${cx}" cy="${cy}" r="${Math.max(0.25,s*0.09)}" fill="${black}"/>`;
+  if(type==='landmark') return `<polygon points="${cx},${cy-s/1.8} ${cx+s/1.8},${cy} ${cx},${cy+s/1.8} ${cx-s/1.8},${cy}" fill="none" stroke="${black}" stroke-width="${bw}"/>`;
   return '';
 }
 function svgSymbolInline(sym, s){ return svgSymbol(sym.id, s/2+1, s/2+1, s); }
-function hatchLines(x,y,w,h){
+function hatchLines(x,y,w,h,fullSize){
+  // sparse, light diagonal hatch — spacing and thickness both scale with symbol size
+  // so it reads as a "shaded" pattern, never as a near-solid dark box
+  const ref = fullSize||w;
+  const lineWidth = Math.max(0.08, ref*0.03);
+  const spacing = Math.max(w/2.2, ref*0.4);
   let l='';
-  for(let i=0;i<=w+h;i+=w/3){ l+=`<line x1="${x+Math.max(0,i-h)}" y1="${y+Math.min(i,h)}" x2="${x+Math.min(i,w)}" y2="${y+Math.max(0,i-w)}" stroke="#000" stroke-width="0.3"/>`; }
-  return `<g clip-path="url(#clip)">${l}</g>`;
+  for(let i=spacing/2; i<w+h; i+=spacing){
+    l+=`<line x1="${x+Math.max(0,i-h)}" y1="${y+Math.min(i,h)}" x2="${x+Math.min(i,w)}" y2="${y+Math.max(0,i-w)}" stroke="#000" stroke-width="${lineWidth.toFixed(2)}"/>`;
+  }
+  return `<g>${l}</g>`;
 }
 
 /* ================= Import outline from reference image/PDF ================= */
@@ -1689,21 +1711,54 @@ document.getElementById('exportBackup').onclick=async ()=>{
   download('hlb_backup_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify(backup), 'application/json');
   showToast('Backed up '+count+' block(s)');
 };
+let pendingBackupData=null;
 document.getElementById('importBackupInput').addEventListener('change', async (e)=>{
-  const file = e.target.files[0]; if(!file) return;
+  const file = e.target.files[0];
+  const preview = document.getElementById('backupPreview');
+  if(!file){ preview.style.display='none'; pendingBackupData=null; return; }
+  let data;
   try{
     const text = await file.text();
-    const data = JSON.parse(text);
-    if(!data || !data.blocks){ showToast('Not a valid backup file'); return; }
-    let count=0;
-    for(const [bId,bData] of Object.entries(data.blocks)){
-      await storageSet('hlb:'+bId, JSON.stringify(bData));
-      count++;
+    data = JSON.parse(text);
+  }catch(err){
+    preview.style.display='block';
+    preview.innerHTML = '<span style="color:var(--danger);">Could not read that file — is it a valid backup JSON?</span>';
+    pendingBackupData=null;
+    return;
+  }
+  if(!data || typeof data.blocks !== 'object' || data.blocks===null){
+    preview.style.display='block';
+    preview.innerHTML = '<span style="color:var(--danger);">Not a valid backup file (no blocks found).</span>';
+    pendingBackupData=null;
+    return;
+  }
+  const blockIds = Object.keys(data.blocks);
+  pendingBackupData = data;
+  preview.style.display='block';
+  preview.innerHTML = `
+    <div style="color:var(--paper); margin-bottom:6px;">Found <strong style="color:var(--amber);">${blockIds.length}</strong> block(s)${data.exportedAt ? ' — exported '+new Date(data.exportedAt).toLocaleString() : ''}:</div>
+    <div style="color:var(--text-dim); margin-bottom:10px; max-height:80px; overflow-y:auto;">${blockIds.map(id=>escapeXml(id)).join(', ')}</div>
+    <div style="color:var(--danger); margin-bottom:10px;">This will overwrite any of these blocks already saved on this device.</div>
+    <div style="display:flex; gap:8px;">
+      <button class="btn-save" id="confirmImportBtn" style="flex:1;">Import Now</button>
+      <button class="btn-cancel" id="cancelImportBtn" style="flex:1;">Cancel</button>
+    </div>`;
+  document.getElementById('cancelImportBtn').onclick=()=>{
+    preview.style.display='none'; preview.innerHTML=''; pendingBackupData=null;
+    document.getElementById('importBackupInput').value='';
+  };
+  document.getElementById('confirmImportBtn').onclick=async ()=>{
+    if(!pendingBackupData) return;
+    let ok=0, failed=0;
+    for(const [bId,bData] of Object.entries(pendingBackupData.blocks)){
+      try{ await storageSet('hlb:'+bId, JSON.stringify(bData)); ok++; }
+      catch(err){ failed++; console.warn('Failed to import block', bId, err); }
     }
-    showToast('Imported '+count+' block(s)');
-    if(blockId && data.blocks[blockId]){ await loadBlock(blockId); }
-    e.target.value='';
-  }catch(err){ showToast('Could not read that backup file'); }
+    showToast(failed>0 ? `Imported ${ok} block(s), ${failed} failed` : `Imported ${ok} block(s)`);
+    if(blockId && pendingBackupData.blocks[blockId]){ await loadBlock(blockId); }
+    preview.style.display='none'; preview.innerHTML=''; pendingBackupData=null;
+    document.getElementById('importBackupInput').value='';
+  };
 });
 
 /* ================= Toast ================= */
